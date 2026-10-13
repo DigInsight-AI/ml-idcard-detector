@@ -1,0 +1,88 @@
+# Direct from-scratch training configuration for the prepared YOLO Pose dataset.
+# Relative paths resolve from the project root.
+data:
+  # Scan every immediate child dataset instead of naming one export.
+  root: data
+  pattern: "*/data.yaml"
+  manifest_directory: runs/datasets/config_v1
+  # Copy selected files into the generated snapshot so Ultralytics cannot repair
+  # or rewrite the source exports in place.
+  image_mode: copy
+  deduplicate_by: stem
+  selection_policy: latest_export
+  required_keypoint_semantics: idcard_canonical_v1
+  # Four physical card corners use a tighter OKS tolerance than human joints.
+  keypoint_oks_sigmas: [0.025, 0.025, 0.025, 0.025]
+
+model:
+  # A model architecture YAML creates a randomly initialized network.
+  architecture: yolo11n-pose.yaml
+  pretrained: false
+
+output:
+  # Effective run directory: runs/idcard-pose-v1
+  project: runs
+  name: idcard-pose-v1
+  # If the directory exists, ask whether to resume from weights/last.pt. Choosing
+  # no deletes the old run directory and starts from scratch in the same path.
+  # Non-interactive alternatives: resume, overwrite, error.
+  existing_run: prompt
+  save: true
+  save_period: 5
+  plots: true
+  save_json: false
+  save_txt: false
+  save_conf: false
+
+training:
+  # null starts from the architecture YAML with random weights. To continue an
+  # interrupted run, use a .pt path relative to output.project or an absolute path.
+  # Example: idcard-pose-v1/weights/last.pt
+  resume_from: null
+  epochs: 150
+  image_size: 640
+  batch_size: 8
+  device: mps
+  seed: 42
+  patience: 25
+  workers: 0
+  optimizer: AdamW
+  learning_rate: 0.001
+  final_learning_rate_factor: 0.01
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  cosine_lr: false
+  nominal_batch_size: 64
+  fraction: 1.0
+  rect: false
+  dropout: 0.0
+  amp: true
+  deterministic: true
+  cache: false
+  validate: true
+  verbose: true
+  # save_period above writes epoch checkpoints every 5 epochs. Keep only the
+  # newest 3 numbered checkpoints; best.pt and last.pt always remain.
+  keep_last_n: 3
+
+augmentation:
+  # Preserve canonical corner identities by disabling horizontal/vertical flips.
+  degrees: 180.0
+  scale: 0.35
+  translate: 0.15
+  shear: 3.0
+  perspective: 0.0005
+  fliplr: 0.0
+  flipud: 0.0
+  mosaic: 0.20
+  mixup: 0.0
+  cutmix: 0.0
+  copy_paste: 0.0
+  copy_paste_mode: flip
+  close_mosaic: 15
+  multi_scale: 0.25
+  bgr: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
