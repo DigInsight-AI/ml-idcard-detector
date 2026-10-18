@@ -434,7 +434,8 @@ def _copy_training_image(source, directory):
     from PIL import Image
 
     suffixes = {
-        "JPEG": (".jpg", ".jpeg"), "PNG": (".png",), "BMP": (".bmp",),
+        "JPEG": (".jpg", ".jpeg"), "MPO": (".jpg", ".jpeg"),
+        "PNG": (".png",), "BMP": (".bmp",),
         "TIFF": (".tif", ".tiff"), "WEBP": (".webp",),
     }
     normalized = None
@@ -445,7 +446,17 @@ def _copy_training_image(source, directory):
                 raise TrainingError("unsupported image format %s: %s" % (image.format, source))
             suffix = source.suffix if source.suffix.lower() in extensions else extensions[0]
             destination = directory / (source.stem + suffix)
-            if image.format == "JPEG":
+            if image.format == "MPO":
+                # Training uses the primary frame; retain orientation for label alignment.
+                image.seek(0)
+                buffer = io.BytesIO()
+                image.convert("RGB").save(
+                    buffer, format="JPEG", quality=95, subsampling=0,
+                    exif=image.info.get("exif", b""),
+                    icc_profile=image.info.get("icc_profile"),
+                )
+                normalized = buffer.getvalue()
+            elif image.format == "JPEG":
                 with source.open("rb") as stream:
                     stream.seek(-2, 2)
                     if stream.read() != b"\xff\xd9":
@@ -455,13 +466,22 @@ def _copy_training_image(source, directory):
                         if end >= 0:
                             candidate = data[:end + 2]
                             # Strip trailer bytes only if decoding preserves every pixel.
-                            with Image.open(io.BytesIO(candidate)) as trimmed:
-                                image.load()
-                                trimmed.load()
-                                if (image.mode, image.size, image.tobytes()) == (
-                                    trimmed.mode, trimmed.size, trimmed.tobytes()
-                                ):
-                                    normalized = candidate
+                            try:
+                                with Image.open(io.BytesIO(candidate)) as trimmed:
+                                    image.load()
+                                    trimmed.load()
+                                    if (image.mode, image.size, image.tobytes()) == (
+                                        trimmed.mode, trimmed.size, trimmed.tobytes()
+                                    ):
+                                        normalized = candidate
+                            except (OSError, ValueError):
+                                # An EOI inside metadata may not terminate the main image.
+                                pass
+                        if normalized is None:
+                            candidate = data + b"\xff\xd9"
+                            with Image.open(io.BytesIO(candidate)) as repaired:
+                                repaired.load()
+                            normalized = candidate
     except (OSError, ValueError) as error:
         raise TrainingError("could not prepare image %s: %s" % (source, error)) from error
 
