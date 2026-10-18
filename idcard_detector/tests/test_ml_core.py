@@ -1,18 +1,24 @@
+import json
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest import mock
+
+import numpy as np
 
 from idcard_detector.cli import build_parser
 from idcard_detector.geometry import GeometryError, validate_keypoints
 from idcard_detector.training import (
     DEFAULT_CONFIG,
     TrainingError,
+    _configure_device_runtime,
     _prepare_output_directory,
     load_training_config,
     train_pose_from_config,
 )
+from idcard_detector.training_logging import EpochMetricsLogger
 
 
 class MLPipelineContractTest(unittest.TestCase):
@@ -97,7 +103,7 @@ class MLPipelineContractTest(unittest.TestCase):
                 captured["model"] = model
 
             def add_callback(self, event, callback):
-                captured["callback_event"] = event
+                captured.setdefault("callback_events", []).append(event)
 
             def train(self, **arguments):
                 captured.update(arguments)
@@ -119,7 +125,15 @@ class MLPipelineContractTest(unittest.TestCase):
         self.assertEqual(captured["epochs"], 150)
         self.assertEqual(captured["imgsz"], 640)
         self.assertFalse(captured["pretrained"])
-        self.assertEqual(captured["callback_event"], "on_model_save")
+        self.assertEqual(
+            captured["callback_events"],
+            [
+                "on_train_start",
+                "on_train_epoch_start",
+                "on_fit_epoch_end",
+                "on_model_save",
+            ],
+        )
         self.assertNotIn("resume", captured)
 
     def test_training_resumes_checkpoint_in_configured_output_directory(self):
@@ -131,7 +145,7 @@ class MLPipelineContractTest(unittest.TestCase):
                 self.trainer = None
 
             def add_callback(self, event, callback):
-                captured["callback_event"] = event
+                captured.setdefault("callback_events", []).append(event)
 
             def train(self, **arguments):
                 captured.update(arguments)
@@ -177,6 +191,90 @@ class MLPipelineContractTest(unittest.TestCase):
         self.assertEqual(captured["_resume_save_dir"], "/tmp/runs/resumed")
         self.assertIn("trainer", captured)
         self.assertEqual(result["resume_from"], configuration["resume_from"])
+
+    def test_epoch_logger_writes_detailed_metrics(self):
+        class FakeMetric:
+            def __init__(self, result, map75):
+                self._result = result
+                self.map75 = map75
+                self.all_ap = np.array([[0.1, 0.2, 0.3, 0.4, 0.5, map75, 0.7]])
+
+            def class_result(self, index):
+                self.assert_index(index)
+                return self._result
+
+            @staticmethod
+            def assert_index(index):
+                if index != 0:
+                    raise AssertionError("unexpected class result index")
+
+        with tempfile.TemporaryDirectory() as directory:
+            logger = EpochMetricsLogger()
+            pose_metrics = SimpleNamespace(
+                ap_class_index=np.array([0]),
+                names={0: "idcard"},
+                nt_per_image=np.array([7]),
+                nt_per_class=np.array([8]),
+                box=FakeMetric((0.9, 0.8, 0.85, 0.7), 0.75),
+                pose=FakeMetric((0.88, 0.77, 0.82, 0.66), 0.72),
+            )
+            trainer = SimpleNamespace(
+                save_dir=directory,
+                args=SimpleNamespace(val=True),
+                epoch=0,
+                epochs=10,
+                tloss={"box_loss": 1.2, "pose_loss": 2.3},
+                metrics={
+                    "metrics/precision(B)": 0.9,
+                    "metrics/recall(B)": 0.8,
+                    "metrics/mAP50(B)": 0.85,
+                    "metrics/mAP50-95(B)": 0.7,
+                    "metrics/precision(P)": 0.88,
+                    "metrics/recall(P)": 0.77,
+                    "metrics/mAP50(P)": 0.82,
+                    "metrics/mAP50-95(P)": 0.66,
+                    "val/box_loss": 1.0,
+                    "val/pose_loss": 2.0,
+                },
+                lr={"lr/pg0": 0.001},
+                fitness=0.75,
+                best_fitness=0.75,
+                epoch_time=62.0,
+                validator=SimpleNamespace(metrics=pose_metrics),
+                label_loss_items=lambda values: {
+                    "train/%s" % key: value for key, value in values.items()
+                },
+            )
+
+            logger.on_train_start(trainer)
+            logger.on_train_epoch_start(trainer)
+            logger.on_fit_epoch_end(trainer)
+            logger.on_fit_epoch_end(trainer)
+
+            train_log = (Path(directory) / "train.log").read_text(encoding="utf-8")
+            self.assertIn("Epoch [1/10] completed", train_log)
+            self.assertIn("mAP75=0.750000", train_log)
+            self.assertIn("per-class validation metrics", train_log)
+            metric_lines = (
+                Path(directory) / "metrics.jsonl"
+            ).read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(metric_lines), 1)
+            record = json.loads(metric_lines[0])
+            self.assertEqual(record["class_metrics"][0]["instances"], 8)
+            self.assertAlmostEqual(record["class_metrics"][0]["pose_map75"], 0.72)
+            class_csv = (Path(directory) / "class_metrics.csv").read_text(encoding="utf-8")
+            self.assertIn("pose_map50_95", class_csv)
+            self.assertIn("idcard", class_csv)
+
+    def test_mps_runtime_filters_known_pytorch_noise(self):
+        _configure_device_runtime({"device": "mps"})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.warn(
+                "scatter_reduce_mps does not have a deterministic implementation, "
+                "but deterministic algorithms are enabled.",
+                UserWarning,
+            )
+        self.assertEqual(caught, [])
 
     def test_existing_run_prompt_can_resume_last_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:

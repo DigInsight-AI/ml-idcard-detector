@@ -1,8 +1,12 @@
+import io
 import json
 import re
 import shutil
 import tempfile
+import warnings
 from pathlib import Path
+
+from .training_logging import EpochMetricsLogger
 
 
 class TrainingError(RuntimeError):
@@ -145,7 +149,12 @@ def train_pose_from_config(path=DEFAULT_CONFIG, materialize=True, prompt=None):
         )
 
     resume_from = _prepare_output_directory(configuration, prompt)
+    _configure_device_runtime(configuration["arguments"])
     trainer = YOLO(resume_from or configuration["model"])
+    metrics_logger = EpochMetricsLogger()
+    trainer.add_callback("on_train_start", metrics_logger.on_train_start)
+    trainer.add_callback("on_train_epoch_start", metrics_logger.on_train_epoch_start)
+    trainer.add_callback("on_fit_epoch_end", metrics_logger.on_fit_epoch_end)
     trainer.add_callback(
         "on_model_save",
         lambda active: prune_epoch_checkpoints(
@@ -177,6 +186,26 @@ def train_pose_from_config(path=DEFAULT_CONFIG, materialize=True, prompt=None):
         "resume_from": resume_from,
         "dataset": configuration["dataset"],
     }
+
+
+def _configure_device_runtime(arguments):
+    device = str(arguments.get("device") or "").lower()
+    if device != "mps":
+        return
+    # Some PyTorch versions emit this even when the loader later disables
+    # pinned memory for MPS. It is expected and has no effect on training.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"'pin_memory' argument is set as true but not supported on MPS now.*",
+        category=UserWarning,
+        module=r"torch\.utils\.data\.dataloader",
+    )
+    for operation in ("index_put_with_accumulate_mps", "scatter_reduce_mps"):
+        warnings.filterwarnings(
+            "ignore",
+            message=r"%s does not have a deterministic implementation.*" % operation,
+            category=UserWarning,
+        )
 
 
 def prune_epoch_checkpoints(weights_directory, keep_last_n):
@@ -393,12 +422,56 @@ def _materialize_samples(samples, destination):
         label_directory = destination / "labels" / split
         image_directory.mkdir(parents=True, exist_ok=True)
         label_directory.mkdir(parents=True, exist_ok=True)
-        image_target = image_directory / value["image"].name
+        image_target, image_copied = _copy_training_image(value["image"], image_directory)
         label_target = label_directory / value["label"].name
-        copied += _copy_if_changed(value["image"], image_target)
+        copied += image_copied
         copied += _copy_if_changed(value["label"], label_target)
         value["training_image"] = image_target
     return copied
+
+
+def _copy_training_image(source, directory):
+    from PIL import Image
+
+    suffixes = {
+        "JPEG": (".jpg", ".jpeg"), "PNG": (".png",), "BMP": (".bmp",),
+        "TIFF": (".tif", ".tiff"), "WEBP": (".webp",),
+    }
+    normalized = None
+    try:
+        with Image.open(source) as image:
+            extensions = suffixes.get(image.format)
+            if extensions is None:
+                raise TrainingError("unsupported image format %s: %s" % (image.format, source))
+            suffix = source.suffix if source.suffix.lower() in extensions else extensions[0]
+            destination = directory / (source.stem + suffix)
+            if image.format == "JPEG":
+                with source.open("rb") as stream:
+                    stream.seek(-2, 2)
+                    if stream.read() != b"\xff\xd9":
+                        stream.seek(0)
+                        data = stream.read()
+                        end = data.rfind(b"\xff\xd9")
+                        if end >= 0:
+                            candidate = data[:end + 2]
+                            # Strip trailer bytes only if decoding preserves every pixel.
+                            with Image.open(io.BytesIO(candidate)) as trimmed:
+                                image.load()
+                                trimmed.load()
+                                if (image.mode, image.size, image.tobytes()) == (
+                                    trimmed.mode, trimmed.size, trimmed.tobytes()
+                                ):
+                                    normalized = candidate
+    except (OSError, ValueError) as error:
+        raise TrainingError("could not prepare image %s: %s" % (source, error)) from error
+
+    if normalized is None:
+        return destination, _copy_if_changed(source, destination)
+    if destination.is_file() and destination.read_bytes() == normalized:
+        return destination, 0
+    destination.write_bytes(normalized)
+    shutil.copystat(source, destination)
+    return destination, 1
 
 
 def _copy_if_changed(source, destination):

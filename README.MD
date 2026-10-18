@@ -121,6 +121,14 @@ POSE_CONFIG=/path/to/config_v2.yaml ./scripts/pose-train.sh
 
 Results are written to `runs/idcard-pose-v1/`. `best.pt` and `last.pt` are always retained; `training.keep_last_n` controls periodic checkpoint retention.
 
+Each completed epoch also writes a timestamped professional summary with train/validation losses, Box and Pose precision, recall, F1, mAP50, mAP75, mAP50-95, fitness, learning rates, duration, and per-class validation metrics.
+
+| Training log | Contents |
+| --- | --- |
+| `train.log` | Human-readable per-epoch summaries, also printed to the console |
+| `metrics.jsonl` | One structured metrics record per completed epoch |
+| `class_metrics.csv` | Per-class Box and Pose metrics for every completed epoch |
+
 ## Inference
 
 ```bash
