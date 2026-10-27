@@ -26,12 +26,12 @@ class MLPipelineContractTest(unittest.TestCase):
         with self.assertRaises(GeometryError):
             validate_keypoints([[0, 0], [0, 80], [100, 80], [100, 0]])
 
-    def test_cli_contains_only_train_and_infer(self):
+    def test_cli_contains_train_infer_and_augment(self):
         parser = build_parser()
         commands = next(
             action for action in parser._actions if getattr(action, "choices", None)
         )
-        self.assertEqual(set(commands.choices), {"train", "infer"})
+        self.assertEqual(set(commands.choices), {"train", "infer", "augment"})
 
     def test_training_defaults_to_config_v1(self):
         arguments = build_parser().parse_args(["train"])
@@ -128,6 +128,7 @@ class MLPipelineContractTest(unittest.TestCase):
         self.assertEqual(
             captured["callback_events"],
             [
+                "on_train_start",
                 "on_train_start",
                 "on_train_epoch_start",
                 "on_fit_epoch_end",

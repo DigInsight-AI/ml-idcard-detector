@@ -11,7 +11,7 @@ data:
   deduplicate_by: stem
   selection_policy: latest_export
   required_keypoint_semantics: idcard_canonical_v1
-  # Four physical card corners use a tighter OKS tolerance than human joints.
+  # Strict evaluation tolerance; training loss uses independent sigmas below.
   keypoint_oks_sigmas: [0.025, 0.025, 0.025, 0.025]
 
 model:
@@ -35,6 +35,9 @@ output:
   save_conf: false
 
 training:
+  # Broad loss sigmas prevent distant, randomly initialized corners from
+  # entering the zero-gradient region of the exponential keypoint loss.
+  keypoint_loss_sigmas: [0.25, 0.25, 0.25, 0.25]
   # null starts from the architecture YAML with random weights. To continue an
   # interrupted run, use a .pt path relative to output.project or an absolute path.
   # Example: idcard-pose-v1/weights/last.pt

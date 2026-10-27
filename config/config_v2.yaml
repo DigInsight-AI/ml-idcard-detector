@@ -1,0 +1,81 @@
+# Fine-tune the completed v1 model on all current exports with a fresh optimizer.
+# Relative paths resolve from the project root, except training.resume_from.
+data:
+  root: data
+  pattern: "*/data.yaml"
+  manifest_directory: runs/datasets/config_v2
+  image_mode: copy
+  deduplicate_by: stem
+  selection_policy: latest_export
+  required_keypoint_semantics: idcard_canonical_v1
+  keypoint_oks_sigmas: [0.025, 0.025, 0.025, 0.025]
+
+model:
+  architecture: yolo11n-pose.yaml
+  # Keep pretrained=true: false would discard the loaded checkpoint weights.
+  pretrained: true
+  initial_weights: runs/idcard-pose-v1/weights/best.pt
+
+output:
+  project: runs
+  name: idcard-pose-v2
+  existing_run: error
+  save: true
+  save_period: 5
+  plots: true
+  save_json: false
+  save_txt: false
+  save_conf: false
+
+training:
+  keypoint_loss_sigmas: [0.25, 0.25, 0.25, 0.25]
+  resume_from: null
+  epochs: 50
+  image_size: 640
+  batch_size: 8
+  device: mps
+  seed: 42
+  patience: 15
+  workers: 0
+  optimizer: AdamW
+  # Smaller updates adapt reviewed corners without repeating scratch training.
+  learning_rate: 0.0001
+  final_learning_rate_factor: 0.1
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 2.0
+  # AdamW otherwise inherits a 0.1 bias warmup, far above the fine-tuning LR.
+  warmup_bias_lr: 0.0
+  cosine_lr: false
+  nominal_batch_size: 64
+  fraction: 1.0
+  rect: false
+  dropout: 0.0
+  amp: true
+  deterministic: true
+  cache: false
+  validate: true
+  verbose: true
+  keep_last_n: 3
+
+augmentation:
+  degrees: 180.0
+  scale: 0.35
+  translate: 0.15
+  shear: 3.0
+  perspective: 0.0005
+  fliplr: 0.0
+  flipud: 0.0
+  # This refinement recipe removes mosaic and input-size jitter together.
+  # It is a combined recipe, not a single-factor augmentation experiment.
+  mosaic: 0.0
+  mixup: 0.0
+  cutmix: 0.0
+  copy_paste: 0.0
+  copy_paste_mode: flip
+  close_mosaic: 0
+  multi_scale: 0.0
+  bgr: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4

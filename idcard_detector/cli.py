@@ -21,6 +21,11 @@ def build_parser():
     )
     train.add_argument("--config", default=str(DEFAULT_CONFIG))
 
+    from .augmentation import add_arguments
+
+    augment = subparsers.add_parser("augment", help="Construct a separate synthetic pose training dataset.")
+    add_arguments(augment)
+
     infer = subparsers.add_parser("infer", help="Run pose, rectification, quality checks, and optional OCR.")
     infer.add_argument("--model", required=True)
     infer.add_argument("--image", required=True)
@@ -37,6 +42,18 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.command == "augment":
+        import json
+        from .augmentation import AugmentationError, generate_dataset
+
+        options = vars(args).copy()
+        options.pop("command")
+        try:
+            result = generate_dataset(**options, progress=lambda text: print(text, flush=True))
+        except (AugmentationError, OSError) as error:
+            raise SystemExit(str(error))
+        print(json.dumps(result, indent=2))
+        return
     if args.command == "train":
         try:
             result = train_pose_from_config(args.config)
@@ -53,6 +70,8 @@ def main(argv=None):
         )
         if result["resume_from"]:
             print("Resumed checkpoint: %s" % result["resume_from"])
+        elif result.get("initial_weights"):
+            print("Initial weights: %s" % result["initial_weights"])
         print("Training output: %s" % (result["save_dir"] or "completed"))
         return
 

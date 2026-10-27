@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import re
 import shutil
 import tempfile
@@ -44,7 +45,7 @@ _SECTION_KEYS = {
         "selection_policy", "required_keypoint_semantics", "keypoint_oks_sigmas",
         "image_mode",
     },
-    "model": {"architecture", "pretrained"},
+    "model": {"architecture", "pretrained", "initial_weights"},
     "output": {
         "project", "name", "existing_run", "save", "save_period", "plots",
         "save_json", "save_txt", "save_conf",
@@ -55,6 +56,7 @@ _SECTION_KEYS = {
         "momentum", "weight_decay", "warmup_epochs", "amp", "deterministic",
         "cache", "validate", "keep_last_n", "cosine_lr", "nominal_batch_size",
         "fraction", "rect", "dropout", "verbose", "resume_from",
+        "keypoint_loss_sigmas", "warmup_bias_lr",
     },
     "augmentation": {
         "degrees", "scale", "translate", "shear", "perspective", "fliplr",
@@ -92,13 +94,30 @@ def load_training_config(path=DEFAULT_CONFIG, materialize=False):
         raise TrainingError("training configuration root must be a mapping")
     _validate_sections(document)
 
-    dataset = _build_combined_dataset(document["data"], yaml, materialize)
+    loss_sigmas = document["training"].get("keypoint_loss_sigmas", [0.25] * 4)
+    if (
+        not isinstance(loss_sigmas, (list, tuple))
+        or len(loss_sigmas) != 4
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value <= 0
+            for value in loss_sigmas
+        )
+    ):
+        raise TrainingError("training.keypoint_loss_sigmas must contain four positive finite numbers")
 
     model = document["model"]
     architecture = str(model.get("architecture") or "").strip()
     if not architecture.endswith(".yaml"):
         raise TrainingError("model.architecture must be a Pose architecture .yaml")
-    if model.get("pretrained") is not False:
+    initial_weights = _checkpoint_path(
+        model.get("initial_weights"), PROJECT_ROOT, "model.initial_weights"
+    )
+    if initial_weights is not None and model.get("pretrained") is not True:
+        raise TrainingError("model.pretrained must be true when model.initial_weights is set")
+    if initial_weights is None and model.get("pretrained") is not False:
         raise TrainingError("model.pretrained must be false for from-scratch training")
 
     output = document["output"]
@@ -112,6 +131,10 @@ def load_training_config(path=DEFAULT_CONFIG, materialize=False):
             "output.existing_run must be prompt, resume, overwrite, or error"
         )
     resume_from = _resume_checkpoint(document["training"].get("resume_from"), project)
+    if initial_weights is not None and resume_from is not None:
+        raise TrainingError("model.initial_weights and training.resume_from cannot both be set")
+
+    dataset = _build_combined_dataset(document["data"], yaml, materialize)
 
     arguments = {
         "data": dataset["data_yaml"],
@@ -124,17 +147,19 @@ def load_training_config(path=DEFAULT_CONFIG, materialize=False):
         for key, value in document[section].items():
             if section == "output" and key in ("project", "name", "existing_run"):
                 continue
-            if key in ("keep_last_n", "resume_from"):
+            if key in ("keep_last_n", "resume_from", "keypoint_loss_sigmas"):
                 continue
             arguments[_ARGUMENT_NAMES.get(key, key)] = value
     _validate_arguments(arguments, document["training"]["keep_last_n"])
     return {
         "config_path": str(config_path),
-        "model": architecture,
+        "model": str(initial_weights) if initial_weights else architecture,
+        "initial_weights": str(initial_weights) if initial_weights else None,
         "existing_run": existing_run,
         "resume_from": str(resume_from) if resume_from else None,
         "arguments": arguments,
         "keep_last_n": int(document["training"]["keep_last_n"]),
+        "keypoint_loss_sigmas": [float(value) for value in loss_sigmas],
         "dataset": dataset,
     }
 
@@ -152,17 +177,25 @@ def train_pose_from_config(path=DEFAULT_CONFIG, materialize=True, prompt=None):
     _configure_device_runtime(configuration["arguments"])
     trainer = YOLO(resume_from or configuration["model"])
     metrics_logger = EpochMetricsLogger()
+    trainer.add_callback(
+        "on_train_start",
+        lambda active: _configure_pose_loss(
+            active, configuration.get("keypoint_loss_sigmas", [0.25] * 4)
+        ),
+    )
     trainer.add_callback("on_train_start", metrics_logger.on_train_start)
     trainer.add_callback("on_train_epoch_start", metrics_logger.on_train_epoch_start)
     trainer.add_callback("on_fit_epoch_end", metrics_logger.on_fit_epoch_end)
     trainer.add_callback(
         "on_model_save",
-        lambda active: prune_epoch_checkpoints(
-            active.wdir, configuration["keep_last_n"]
+        lambda active: _save_training_checkpoints(
+            active, configuration["keep_last_n"]
         ),
     )
     arguments = dict(configuration["arguments"])
     if resume_from is None:
+        if configuration.get("initial_weights"):
+            arguments["resume"] = False
         result = trainer.train(**arguments)
     else:
         try:
@@ -184,8 +217,27 @@ def train_pose_from_config(path=DEFAULT_CONFIG, materialize=True, prompt=None):
         "save_dir": str(save_dir) if save_dir else None,
         "config_path": configuration["config_path"],
         "resume_from": resume_from,
+        "initial_weights": configuration.get("initial_weights"),
         "dataset": configuration["dataset"],
     }
+
+
+def _configure_pose_loss(trainer, sigmas):
+    from ultralytics.utils.torch_utils import unwrap_model
+
+    # Keep strict dataset OKS sigmas for evaluation; broad loss sigmas allow
+    # randomly initialized corners to learn even when initially far from GT.
+    models = [unwrap_model(trainer.model)]
+    if trainer.ema is not None:
+        models.append(trainer.ema.ema)
+    for model in models:
+        model.kpt_oks_sigmas = list(sigmas)
+        model.criterion = None
+    print(
+        "Pose sigmas: training loss=%s, evaluation OKS=%s"
+        % (list(sigmas), trainer.data.get("kpt_oks_sigmas")),
+        flush=True,
+    )
 
 
 def _configure_device_runtime(arguments):
@@ -208,6 +260,33 @@ def _configure_device_runtime(arguments):
         )
 
 
+def _save_training_checkpoints(trainer, keep_last_n):
+    save_pose_best_checkpoint(trainer)
+    prune_epoch_checkpoints(trainer.wdir, keep_last_n)
+
+
+def save_pose_best_checkpoint(trainer):
+    """Retain the best Pose AP independently of combined box/pose fitness."""
+    score = trainer.metrics.get("metrics/mAP50-95(P)")
+    if score is None or not math.isfinite(float(score)):
+        return
+    directory = Path(trainer.wdir)
+    metadata = directory / "best_pose.json"
+    best = directory / "best_pose.pt"
+    if metadata.exists() and best.exists():
+        previous = json.loads(metadata.read_text(encoding="utf-8"))
+        if float(score) <= previous["pose_map50_95"]:
+            return
+    temporary = directory / "best_pose.pt.tmp"
+    shutil.copy2(trainer.last, temporary)
+    temporary.replace(best)
+    metadata.write_text(
+        json.dumps({"epoch": int(trainer.epoch) + 1,
+                    "pose_map50_95": float(score)}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
 def prune_epoch_checkpoints(weights_directory, keep_last_n):
     numbered = []
     for path in Path(weights_directory).glob("epoch*.pt"):
@@ -220,16 +299,20 @@ def prune_epoch_checkpoints(weights_directory, keep_last_n):
 
 
 def _resume_checkpoint(value, output_project):
+    return _checkpoint_path(value, output_project, "training.resume_from")
+
+
+def _checkpoint_path(value, base_directory, field):
     if value is None or not str(value).strip():
         return None
     checkpoint = Path(str(value)).expanduser()
     if not checkpoint.is_absolute():
-        checkpoint = output_project / checkpoint
+        checkpoint = base_directory / checkpoint
     checkpoint = checkpoint.resolve()
     if checkpoint.suffix.lower() != ".pt":
-        raise TrainingError("training.resume_from must be a .pt checkpoint: %s" % checkpoint)
+        raise TrainingError("%s must be a .pt checkpoint: %s" % (field, checkpoint))
     if not checkpoint.is_file():
-        raise TrainingError("training.resume_from does not exist: %s" % checkpoint)
+        raise TrainingError("%s does not exist: %s" % (field, checkpoint))
     return checkpoint
 
 
@@ -614,6 +697,10 @@ def _write_text(path, content):
 
 
 def _validate_arguments(arguments, keep_last_n):
+    if "warmup_bias_lr" in arguments:
+        rate = float(arguments["warmup_bias_lr"])
+        if not math.isfinite(rate) or rate < 0:
+            raise TrainingError("warmup_bias_lr must be non-negative and finite")
     for name in ("epochs", "imgsz", "batch", "patience"):
         if int(arguments[name]) <= 0:
             raise TrainingError("%s must be greater than zero" % name)

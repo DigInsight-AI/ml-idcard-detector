@@ -1,0 +1,79 @@
+# Adapt the verified r008 corner model to the current two-class dataset.
+# Relative paths resolve from the project root, except training.resume_from.
+data:
+  root: data
+  pattern: "*/data.yaml"
+  manifest_directory: runs/datasets/config_v3
+  image_mode: copy
+  deduplicate_by: stem
+  selection_policy: latest_export
+  required_keypoint_semantics: idcard_canonical_v1
+  keypoint_oks_sigmas: [0.025, 0.025, 0.025, 0.025]
+
+model:
+  architecture: yolo11n-pose.yaml
+  pretrained: true
+  # Local frozen copy of the historical single-class r008 checkpoint.
+  initial_weights: runs/pretrained/r008-best.pt
+
+output:
+  project: runs
+  name: idcard-pose-v3-r008
+  existing_run: error
+  save: true
+  save_period: 1
+  plots: true
+  save_json: false
+  save_txt: false
+  save_conf: false
+
+training:
+  # Preserve r008's precision loss; corners already converge at initialization.
+  keypoint_loss_sigmas: [0.025, 0.025, 0.025, 0.025]
+  resume_from: null
+  epochs: 150
+  image_size: 640
+  batch_size: 8
+  device: mps
+  seed: 42
+  patience: 25
+  workers: 0
+  optimizer: AdamW
+  # Match the historical r008 optimization schedule and warmup exactly.
+  learning_rate: 0.0002
+  final_learning_rate_factor: 0.05
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3.0
+  warmup_bias_lr: 0.1
+  cosine_lr: false
+  nominal_batch_size: 64
+  fraction: 1.0
+  rect: false
+  dropout: 0.0
+  amp: true
+  deterministic: true
+  cache: false
+  validate: true
+  verbose: true
+  keep_last_n: 5
+
+augmentation:
+  degrees: 180.0
+  scale: 0.35
+  translate: 0.15
+  shear: 3.0
+  perspective: 0.0005
+  fliplr: 0.0
+  flipud: 0.0
+  mosaic: 0.2
+  mixup: 0.0
+  cutmix: 0.0
+  copy_paste: 0.0
+  copy_paste_mode: flip
+  close_mosaic: 15
+  multi_scale: 0.25
+  bgr: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
