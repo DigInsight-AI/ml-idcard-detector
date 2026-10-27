@@ -2,6 +2,10 @@
 
 A YOLO Pose pipeline for ID card detection and rectification. It predicts the card boundary and four semantic corners, then performs perspective rectification, image quality checks, and optional OCR.
 
+## Online Demo
+
+The algorithm demo is now live! Try the [online document detection demo](http://ocr.diginsight.ai/di-ocr-site/demo/document-detection) to experience its real-world detection results. Feedback is welcome.
+
 ## Features
 
 | Component | Capability |
